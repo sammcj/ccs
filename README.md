@@ -118,7 +118,7 @@ PASSTHROUGH_VARS=(
 
 **`PLUGINS_MOUNT`** -- By default the container uses its own persistent plugin directory (`~/.ccs/plugins`). Set this to a host path to mount your host plugins directly instead, e.g. `"${HOME}/.claude/plugins"`.
 
-####Runtime Environment Variables
+### Runtime Environment Variables
 
 | Variable     | Default | Description               |
 | ------------ | ------- | ------------------------- |
