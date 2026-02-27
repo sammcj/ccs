@@ -81,7 +81,44 @@ ccs "refactor this entire codebase" # prompt
 ccs --build
 ```
 
-### Environment Variables
+### Configuration
+
+The `ccs` script has several arrays at the top that you can edit to customise behaviour.
+
+At present these are configured in the ccs script itself, which is not ideal so at some point I will move the configuration out.
+
+**`EXTRA_VOLUMES`** -- Additional host directories to mount into the container as `host_path:container_path`. The workspace (`pwd`) and the ccs config directory (`~/.ccs`) are always mounted automatically. The defaults mount your Claude skills, commands, and agents directories so they're available inside the sandbox:
+
+```bash
+EXTRA_VOLUMES=(
+  "${HOME}/git/anthropic-skills:/Users/${USER}/git/anthropic-skills"
+  "${HOME}/.claude/skills:${CONTAINER_CLAUDE_DIR}/skills"
+  "${HOME}/.claude/commands:${CONTAINER_CLAUDE_DIR}/commands"
+  "${HOME}/.claude/agents:${CONTAINER_CLAUDE_DIR}/agents"
+  # Add more volumes here as needed
+)
+```
+
+To mount additional directories, add entries to this array. For example, to mount a shared library:
+
+```bash
+EXTRA_VOLUMES+=(
+  "${HOME}/git/my-shared-lib:/workspace/lib"
+)
+```
+
+**`PASSTHROUGH_VARS`** -- Host environment variable names to forward into the container. `ANTHROPIC_API_KEY` is always passed through automatically.
+
+```bash
+PASSTHROUGH_VARS=(
+  "GITHUB_TOKEN"
+  # "OPENAI_API_KEY"
+)
+```
+
+**`PLUGINS_MOUNT`** -- By default the container uses its own persistent plugin directory (`~/.ccs/plugins`). Set this to a host path to mount your host plugins directly instead, e.g. `"${HOME}/.claude/plugins"`.
+
+####Runtime Environment Variables
 
 | Variable     | Default | Description               |
 | ------------ | ------- | ------------------------- |
