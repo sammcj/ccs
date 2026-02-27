@@ -141,7 +141,7 @@ ensure_container_service() {
 build_container_image() {
   echo -e "${YELLOW}Building ccs image...${NC}"
   container build \
-    -m 8G \
+    -m 6G \
     --build-arg HOST_USER="$USER" \
     -t ccs:latest \
     "$SCRIPT_DIR"
