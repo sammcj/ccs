@@ -142,7 +142,7 @@ PASSTHROUGH_VARS=(
 
    ```bash
    cd ccs
-   container build -t ccs:latest .
+   container build -m 6G -t ccs:latest .
    ```
 
 3. Install the wrapper script
