@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+#
+# ccs - Run Claude Code in an isolated Apple container (VM)
+#
+# Usage:
+#   ccs              # Start claude --dangerously-skip-permissions in current dir
+#   ccs -c           # Continue last conversation
+#   ccs -n 3         # Start 3 parallel instances in separate terminals
+#   ccs "prompt"     # Start with initial prompt
+#
+# The container provides full VM isolation while sharing your project directory.
+# Your host 'claude' command remains completely unaffected.
+#
+# Container base image: debian:bookworm-slim
+# Container home directory: /home/claude (~/.claude lives at /home/claude/.claude)
+#
+
+set -euo pipefail
+
+# Resolve the directory this script lives in (follows symlinks)
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
+
+# Configuration
+CONTAINER_IMAGE="ccs:latest"
+INSTANCE_PREFIX="ccs"
+
+# Set default memory to 4GB if the machine has less than 24GB RAM, otherwise 6GB.
+TOTAL_RAM_GB="$(sysctl -n hw.memsize)"
+if (( TOTAL_RAM_GB < 24 * 1024 * 1024 * 1024 )); then
+  DEFAULT_MEMORY="4G"
+else
+  DEFAULT_MEMORY="6G"
+fi
+
+# set default CPUs to the number of physical large cores
+DEFAULT_CPUS="$(sysctl -n hw.perflevel0.physicalcpu)"
+
+# Persistent config directory on the host -- mounted as ~/.claude inside the
+# container. Auth, settings, and session state survive across container restarts.
+# On first run you'll need to log in once; after that it just works.
+ccs_CONFIG_DIR="$HOME/.ccs"
+
+# Container-side path for claude's home config dir
+CONTAINER_CLAUDE_DIR="/home/claude/.claude"
+
+# Additional volumes to mount as host_path:container_path.
+# The workspace (pwd) and ccs_CONFIG_DIR are always mounted automatically.
+# These overlay specific host dirs into the container's ~/.claude/.
+EXTRA_VOLUMES=(
+  "${HOME}/git/anthropic-skills:/Users/${USER}/git/anthropic-skills"
+  "${HOME}/.claude/skills:${CONTAINER_CLAUDE_DIR}/skills"
+  "${HOME}/.claude/commands:${CONTAINER_CLAUDE_DIR}/commands"
+  "${HOME}/.claude/agents:${CONTAINER_CLAUDE_DIR}/agents"
+  # "${HOME}/.claude/CLAUDE.md:${CONTAINER_CLAUDE_DIR}/CLAUDE.md"
+  # Add more volumes here as needed
+)
+
+# Plugin mount source. Leave empty to use the container's own persistent plugin
+# directory ($ccs_CONFIG_DIR/plugins). Set to a host path to mount that directly
+# instead, e.g. "${HOME}/.claude/plugins" to share the host's plugins.
+PLUGINS_MOUNT=""
+
+# Host environment variables to pass through to the container.
+# Only the variable NAME is needed -- the value is read from the host at runtime.
+# ANTHROPIC_API_KEY is always passed through automatically.
+PASSTHROUGH_VARS=(
+  "GITHUB_TOKEN"
+  # "OPENAI_API_KEY"
+)
+
+# Colours for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Colour
+
+# Ensure the Apple container CLI is installed, offering to install if missing.
+ensure_container_cli() {
+  if command -v container &>/dev/null; then
+    return 0
+  fi
+
+  echo -e "${YELLOW}Apple 'container' CLI not found.${NC}"
+  read -rp "Install it from GitHub? [y/N] " answer
+  if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+    echo "Install manually from: https://github.com/apple/container/releases"
+    exit 1
+  fi
+
+  # Fetch the latest .pkg URL from GitHub releases
+  local pkg_url
+  pkg_url="$(curl -fsSL https://api.github.com/repos/apple/container/releases/latest \
+    | grep '"browser_download_url".*\.pkg"' \
+    | head -1 \
+    | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/')"
+
+  if [[ -z "$pkg_url" ]]; then
+    echo -e "${RED}Error: could not find .pkg download URL from GitHub releases${NC}" >&2
+    exit 1
+  fi
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  local tmp_pkg="${tmp_dir}/container-installer.pkg"
+
+  echo -e "${BLUE}Downloading ${pkg_url}...${NC}"
+  curl -fSL -o "$tmp_pkg" "$pkg_url"
+
+  echo -e "${BLUE}Installing (requires sudo)...${NC}"
+  sudo installer -pkg "$tmp_pkg" -target /
+  rm -rf "$tmp_dir"
+
+  # Initial setup
+  container system start
+  container system kernel set --recommended
+
+  echo -e "${GREEN}Apple Containers installed successfully${NC}"
+}
+
+# Ensure the Apple container service is running, starting it if necessary.
+ensure_container_service() {
+  if container system status &>/dev/null; then
+    return 0
+  fi
+
+  echo -e "${YELLOW}Starting container service...${NC}"
+  container system start
+  for _ in $(seq 1 10); do
+    if container system status &>/dev/null; then
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  echo -e "${RED}Error: container service failed to start${NC}" >&2
+  exit 1
+}
+
+# Build the container image.
+build_container_image() {
+  echo -e "${YELLOW}Building ccs image...${NC}"
+  container build \
+    -m 8G \
+    --build-arg HOST_USER="$USER" \
+    -t ccs:latest \
+    "$SCRIPT_DIR"
+
+  if ! container image list 2>/dev/null | grep -q "ccs"; then
+    echo -e "${RED}Error: image build failed${NC}" >&2
+    exit 1
+  fi
+  echo -e "${GREEN}Image built successfully${NC}"
+}
+
+# Ensure the container image exists, building it if necessary.
+ensure_container_image() {
+  if container image list 2>/dev/null | grep -q "ccs"; then
+    return 0
+  fi
+
+  build_container_image
+}
+
+# Parse arguments
+NUM_INSTANCES=1
+BUILD_IMAGE=false
+CLAUDE_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  -n | --num)
+    NUM_INSTANCES="$2"
+    shift 2
+    ;;
+  --build)
+    BUILD_IMAGE=true
+    shift
+    ;;
+  --help | -h)
+    echo "ccs - Run Claude Code in isolated VM containers"
+    echo ""
+    echo "Usage:"
+    echo "  ccs [options] [claude-args...]"
+    echo ""
+    echo "Options:"
+    echo "  --build      Rebuild the container image before starting"
+    echo "  -n, --num N        Start N parallel instances in separate terminals"
+    echo "  -h, --help         Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  ccs                    # Interactive claude with dangerous perms"
+    echo "  ccs -c                 # Continue last conversation"
+    echo "  ccs -n 4               # Start 4 parallel instances"
+    echo "  ccs 'build the app'    # Start with a prompt"
+    echo ""
+    echo "Authentication:"
+    echo "  On first run you'll log in inside the container."
+    echo "  Credentials persist in ~/.ccs/ for future runs."
+    echo "  Set ANTHROPIC_API_KEY to skip OAuth login entirely."
+    echo ""
+    echo "Environment:"
+    echo "  CCS_MEMORY      Memory limit (default: $DEFAULT_MEMORY)"
+    echo "  CCS_CPUS        CPU limit (default: $DEFAULT_CPUS)"
+    echo ""
+    echo "Configuration (edit arrays at top of script):"
+    echo "  EXTRA_VOLUMES     Additional volumes as /src:/dst"
+    echo "  PASSTHROUGH_VARS  Host env var names to forward"
+    exit 0
+    ;;
+  *)
+    CLAUDE_ARGS+=("$1")
+    shift
+    ;;
+  esac
+done
+
+# Validate NUM_INSTANCES
+if ! [[ "$NUM_INSTANCES" =~ ^[1-9][0-9]*$ ]]; then
+  echo -e "${RED}Error: -n requires a positive integer, got '$NUM_INSTANCES'${NC}" >&2
+  exit 1
+fi
+
+# Get current directory for mounting
+WORKSPACE_DIR="$(pwd)"
+WORKSPACE_NAME="$(basename "$WORKSPACE_DIR")"
+
+ensure_container_cli
+ensure_container_service
+
+if [[ "$BUILD_IMAGE" == "true" ]]; then
+  build_container_image
+else
+  ensure_container_image
+fi
+
+# Set up persistent config directory
+# shellcheck disable=SC2174
+mkdir -p -m 700 "$ccs_CONFIG_DIR"
+cp -f "$SCRIPT_DIR/container-CLAUDE.md" "$ccs_CONFIG_DIR/CLAUDE.md"
+
+# Handle plugins persistence.
+# If the user set PLUGINS_MOUNT, overlay that path into the container.
+# Otherwise, the container's own plugins live at $ccs_CONFIG_DIR/plugins
+# (persisted automatically since the whole dir is mounted).
+if [[ -n "$PLUGINS_MOUNT" ]]; then
+  EXTRA_VOLUMES+=("${PLUGINS_MOUNT}:${CONTAINER_CLAUDE_DIR}/plugins")
+fi
+
+# Remove any symlinks/dirs that would conflict with overlay mounts.
+# Skills, commands, and agents are provided by EXTRA_VOLUMES mounts instead.
+for vol in "${EXTRA_VOLUMES[@]}"; do
+  local_target="${vol#*:}"
+  # Map container path back to the corresponding host-side ccs path
+  host_path="${ccs_CONFIG_DIR}${local_target#"$CONTAINER_CLAUDE_DIR"}"
+  if [[ "$local_target" == "${CONTAINER_CLAUDE_DIR}"* && -e "$host_path" ]]; then
+    rm -rf "$host_path"
+  fi
+done
+
+if [[ ! -f "$ccs_CONFIG_DIR/.claude.json" ]]; then
+  echo -e "${YELLOW}First run -- you'll be prompted to log in inside the container.${NC}"
+  echo -e "${YELLOW}Credentials will be saved to $ccs_CONFIG_DIR for future runs.${NC}"
+fi
+
+# Resource configuration
+MEMORY="${CCS_MEMORY:-$DEFAULT_MEMORY}"
+CPUS="${CCS_CPUS:-$DEFAULT_CPUS}"
+
+# Function to run a single instance
+run_instance() {
+  local instance_num=$1
+  local instance_name="${INSTANCE_PREFIX}-${WORKSPACE_NAME}-$$-${instance_num}"
+
+  if [[ $NUM_INSTANCES -gt 1 ]]; then
+    echo -e "${BLUE}Starting instance $instance_num...${NC}"
+  fi
+
+  # Build environment arguments
+  local -a env_args=()
+  if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    env_args+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+  fi
+  for var_name in "${PASSTHROUGH_VARS[@]}"; do
+    local val="${!var_name:-}"
+    if [[ -n "$val" ]]; then
+      env_args+=(-e "$var_name=$val")
+    fi
+  done
+
+  # Build volume arguments (skip entries where the source path doesn't exist)
+  local -a vol_args=(
+    -v "$ccs_CONFIG_DIR:$CONTAINER_CLAUDE_DIR"
+    -v "$WORKSPACE_DIR:/workspace"
+  )
+  for vol in "${EXTRA_VOLUMES[@]}"; do
+    local src="${vol%%:*}"
+    if [[ -e "$src" ]]; then
+      vol_args+=(-v "$vol")
+    fi
+  done
+
+  # Run container with workspace mounted
+  container run \
+    --name "$instance_name" \
+    --rm \
+    -t -i \
+    -m "$MEMORY" \
+    -c "$CPUS" \
+    ${env_args[@]+"${env_args[@]}"} \
+    "${vol_args[@]}" \
+    -w /workspace \
+    "$CONTAINER_IMAGE" \
+    claude --dangerously-skip-permissions ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}
+}
+
+# Main execution
+if [[ $NUM_INSTANCES -eq 1 ]]; then
+  # Single instance - run interactively
+  run_instance 1
+else
+  # Multiple instances - run in parallel using separate terminal windows
+  echo -e "${GREEN}Starting $NUM_INSTANCES parallel Claude instances...${NC}"
+  echo -e "${YELLOW}Each instance runs in its own isolated VM${NC}"
+  echo ""
+
+  # Serialise CLAUDE_ARGS for embedding in osascript shell command
+  ARGS_STR=""
+  for arg in ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}; do
+    ARGS_STR+=" '${arg//\'/\'\\\'\'}'"
+  done
+
+  for _ in $(seq 1 "$NUM_INSTANCES"); do
+    # Open new Terminal window and run ccs there
+    osascript <<EOF
+tell application "Terminal"
+    activate
+    do script "cd '${WORKSPACE_DIR}' && ANTHROPIC_API_KEY=\"\$ANTHROPIC_API_KEY\" ccs${ARGS_STR}"
+end tell
+EOF
+    sleep 0.5
+  done
+
+  echo -e "${GREEN}Launched $NUM_INSTANCES instances in separate Terminal windows${NC}"
+  echo ""
+  echo "Each instance has:"
+  echo "  - Isolated VM environment (full process isolation)"
+  echo "  - Shared access to: $WORKSPACE_DIR"
+  echo "  - Full --dangerously-skip-permissions mode"
+  echo "  - ${MEMORY} memory, ${CPUS} CPUs"
+fi
