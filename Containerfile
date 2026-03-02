@@ -97,6 +97,10 @@ RUN chmod +x /usr/local/bin/statusline-command.sh && chown claude:claude /usr/lo
 
 USER claude
 
+# Use HTTPS for GitHub clones so plugins can be installed without an SSH client
+RUN git config --global url."https://github.com/".insteadOf "git@github.com:" \
+ && git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+
 # Ensure all user-installed tools are on PATH
 ENV PATH="/home/claude/.cargo/bin:/home/claude/.local/bin:${PNPM_HOME}:$PATH"
 
