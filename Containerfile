@@ -20,6 +20,7 @@ ARG INSTALL_RUST=true
 ARG INSTALL_GO=true
 ARG INSTALL_NODE=true
 ARG INSTALL_UV=true
+ARG INSTALL_BUN=true
 
 # Install base dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -76,6 +77,10 @@ RUN if [ "$INSTALL_RUST" = "true" ]; then \
 
 RUN if [ "$INSTALL_UV" = "true" ]; then \
         curl --proto '=https' --tlsv1.2 -LsSf https://astral.sh/uv/install.sh | sh; \
+    fi
+
+RUN if [ "$INSTALL_BUN" = "true" ]; then \
+        curl --proto '=https' --tlsv1.2 -fsSL https://bun.com/install | bash; \
     fi
 
 # Install Claude Code via native installer
